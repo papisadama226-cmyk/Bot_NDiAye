@@ -1,0 +1,428 @@
+require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
+const readline = require('readline');
+const pino = require('pino');
+const fetch = require('node-fetch');
+const sharp = require('sharp');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  downloadMediaMessage,
+} = require('@whiskeysockets/baileys');
+
+const PREFIX = process.env.PREFIX || '!';
+const OWNER_NUMBERS = (process.env.OWNER_NUMBERS || '').split(',').filter(Boolean);
+const BOT_PHONE_NUMBER = process.env.BOT_PHONE_NUMBER || '';
+const AI_API_KEY = process.env.AI_API_KEY || '';
+const AI_MODEL = process.env.AI_MODEL || 'gemini-2.0-flash';
+const START_TIME = Date.now();
+
+// Répondeur automatique (messages privés uniquement)
+const AUTO_REPLY_ENABLED = (process.env.AUTO_REPLY_ENABLED || 'false').toLowerCase() === 'true';
+const AUTO_REPLY_MESSAGE = process.env.AUTO_REPLY_MESSAGE || 'Je suis occupé pour le moment, je vous répondrai dès que possible 🙏';
+const AUTO_REPLY_COOLDOWN_MIN = parseInt(process.env.AUTO_REPLY_COOLDOWN_MIN || '60', 10);
+const autoReplyLastSent = new Map(); // jid -> timestamp du dernier envoi
+
+// =========================================================
+// STOCKAGE (warns / bans / règles / mute) — fichier JSON local
+// =========================================================
+const DB_PATH = path.join(__dirname, 'data', 'db.json');
+
+function ensureDb() {
+  const dir = path.dirname(DB_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(DB_PATH)) {
+    fs.writeFileSync(DB_PATH, JSON.stringify({ warns: {}, bans: {}, rules: {}, mutes: {} }, null, 2));
+  }
+}
+function readDb() { ensureDb(); return JSON.parse(fs.readFileSync(DB_PATH, 'utf8')); }
+function writeDb(db) { ensureDb(); fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2)); }
+
+const store = {
+  addWarn(groupId, userJid) {
+    const db = readDb();
+    db.warns[groupId] = db.warns[groupId] || {};
+    db.warns[groupId][userJid] = (db.warns[groupId][userJid] || 0) + 1;
+    writeDb(db);
+    return db.warns[groupId][userJid];
+  },
+  resetWarns(groupId, userJid) {
+    const db = readDb();
+    if (db.warns[groupId]) delete db.warns[groupId][userJid];
+    writeDb(db);
+  },
+  banUser(groupId, userJid) {
+    const db = readDb();
+    db.bans[groupId] = db.bans[groupId] || [];
+    if (!db.bans[groupId].includes(userJid)) db.bans[groupId].push(userJid);
+    writeDb(db);
+  },
+  unbanUser(groupId, userJid) {
+    const db = readDb();
+    db.bans[groupId] = (db.bans[groupId] || []).filter(j => j !== userJid);
+    writeDb(db);
+  },
+  isBanned(groupId, userJid) {
+    const db = readDb();
+    return (db.bans[groupId] || []).includes(userJid);
+  },
+  setRules(groupId, text) {
+    const db = readDb();
+    db.rules[groupId] = text;
+    writeDb(db);
+  },
+  getRules(groupId) {
+    const db = readDb();
+    return db.rules[groupId] || null;
+  },
+};
+
+// =========================================================
+// IA — Gemini (utilisée par !ia, !trad, !resume)
+// =========================================================
+async function askAI(prompt, systemPrompt) {
+  if (!AI_API_KEY) return "⚠️ Aucune clé AI_API_KEY configurée dans le .env. Cette commande est désactivée.";
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${AI_MODEL}:generateContent?key=${AI_API_KEY}`;
+    const body = {
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      ...(systemPrompt ? { systemInstruction: { parts: [{ text: systemPrompt }] } } : {}),
+      generationConfig: { maxOutputTokens: 500 },
+    };
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (data.error) return `⚠️ Erreur API Gemini: ${data.error.message || 'inconnue'}`;
+    const text = data.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+    return text.trim() || "⚠️ Réponse vide de l'IA.";
+  } catch (err) {
+    return `⚠️ Erreur de connexion à l'API Gemini: ${err.message}`;
+  }
+}
+const translate = (text, lang) => askAI(`Traduis ce texte en ${lang}. Réponds uniquement avec la traduction, sans commentaire:\n\n${text}`);
+const summarize = (text) => askAI(`Résume ce texte en 3-4 phrases maximum, en français:\n\n${text}`);
+
+function fmtDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m ${s % 60}s`;
+}
+
+// =========================================================
+// LES 20 COMMANDES
+// =========================================================
+const commands = {
+  menu: {
+    desc: 'Affiche la liste des commandes',
+    handler: async (ctx) => {
+      const list = Object.entries(commands).map(([name, c]) => `▪️ ${PREFIX}${name} — ${c.desc}`).join('\n');
+      await ctx.reply(`🤖 *MENU DU BOT*\n\n${list}`);
+    },
+  },
+  help: {
+    desc: "Affiche l'aide pour une commande précise",
+    handler: async (ctx) => {
+      const name = ctx.args[0]?.replace(PREFIX, '');
+      if (!name || !commands[name]) return ctx.reply(`Utilise: ${PREFIX}help <commande>`);
+      await ctx.reply(`*${PREFIX}${name}*\n${commands[name].desc}`);
+    },
+  },
+  ping: {
+    desc: 'Vérifie si le bot répond (latence)',
+    handler: async (ctx) => {
+      const start = Date.now();
+      const sent = await ctx.reply('🏓 Pong...');
+      await ctx.sock.sendMessage(ctx.from, { text: `🏓 Pong! (${Date.now() - start}ms)`, edit: sent.key });
+    },
+  },
+  ia: {
+    desc: "Pose une question à l'IA — usage: !ia <question>",
+    handler: async (ctx) => {
+      if (!ctx.text) return ctx.reply(`Usage: ${PREFIX}ia <ta question>`);
+      await ctx.reply(await askAI(ctx.text, 'Tu es un assistant utile intégré à un bot WhatsApp. Réponds de façon concise.'));
+    },
+  },
+  trad: {
+    desc: 'Traduit un texte — usage: !trad <langue> <texte>',
+    handler: async (ctx) => {
+      const [lang, ...rest] = ctx.args;
+      const text = rest.join(' ') || ctx.quotedText;
+      if (!lang || !text) return ctx.reply(`Usage: ${PREFIX}trad <langue> <texte>`);
+      await ctx.reply(`🌐 *Traduction (${lang})*\n${await translate(text, lang)}`);
+    },
+  },
+  resume: {
+    desc: 'Résume un texte long — usage: !resume <texte>',
+    handler: async (ctx) => {
+      const text = ctx.text || ctx.quotedText;
+      if (!text) return ctx.reply(`Usage: ${PREFIX}resume <texte>`);
+      await ctx.reply(`📝 *Résumé*\n${await summarize(text)}`);
+    },
+  },
+  owner: {
+    desc: 'Affiche les contacts du/des propriétaire(s)',
+    handler: async (ctx) => {
+      await ctx.reply(`👑 *Propriétaire(s) du bot*\n${OWNER_NUMBERS.map(o => `wa.me/${o}`).join('\n') || 'Non configuré'}`);
+    },
+  },
+  group: {
+    desc: 'Affiche les infos du groupe',
+    handler: async (ctx) => {
+      if (!ctx.isGroup) return ctx.reply('❌ Commande disponible uniquement dans un groupe.');
+      const meta = ctx.groupMetadata;
+      await ctx.reply(`👥 *${meta.subject}*\nMembres: ${meta.participants.length}\nAdmins: ${meta.participants.filter(p => p.admin).length}`);
+    },
+  },
+  kick: {
+    desc: 'Expulse un membre (réponse ou @mention) — admin uniquement',
+    handler: async (ctx) => {
+      if (!ctx.isGroup) return ctx.reply('❌ Commande de groupe uniquement.');
+      if (!ctx.isSenderAdmin) return ctx.reply('❌ Réservé aux admins du groupe.');
+      if (!ctx.isBotAdmin) return ctx.reply('❌ Le bot doit être admin pour ça.');
+      const target = ctx.mentionedJid[0] || ctx.quotedParticipant;
+      if (!target) return ctx.reply('❌ Mentionne ou réponds à la personne à expulser.');
+      await ctx.sock.groupParticipantsUpdate(ctx.from, [target], 'remove');
+      await ctx.reply('✅ Membre expulsé.');
+    },
+  },
+  tagall: {
+    desc: 'Mentionne tous les membres du groupe — admin uniquement',
+    handler: async (ctx) => {
+      if (!ctx.isGroup) return ctx.reply('❌ Commande de groupe uniquement.');
+      if (!ctx.isSenderAdmin) return ctx.reply('❌ Réservé aux admins du groupe.');
+      const participants = ctx.groupMetadata.participants.map(p => p.id);
+      const text = ctx.text || '📢 Attention à tous !';
+      await ctx.sock.sendMessage(ctx.from, { text: `${text}\n\n${participants.map(p => `@${p.split('@')[0]}`).join(' ')}`, mentions: participants });
+    },
+  },
+  warn: {
+    desc: 'Avertit un membre (3 warns = kick auto) — admin uniquement',
+    handler: async (ctx) => {
+      if (!ctx.isGroup) return ctx.reply('❌ Commande de groupe uniquement.');
+      if (!ctx.isSenderAdmin) return ctx.reply('❌ Réservé aux admins du groupe.');
+      const target = ctx.mentionedJid[0] || ctx.quotedParticipant;
+      if (!target) return ctx.reply('❌ Mentionne ou réponds à la personne à avertir.');
+      const count = store.addWarn(ctx.from, target);
+      await ctx.reply(`⚠️ @${target.split('@')[0]} a reçu un avertissement (${count}/3)`, [target]);
+      if (count >= 3 && ctx.isBotAdmin) {
+        await ctx.sock.groupParticipantsUpdate(ctx.from, [target], 'remove');
+        store.resetWarns(ctx.from, target);
+        await ctx.reply(`🚫 @${target.split('@')[0]} expulsé automatiquement (3 avertissements)`, [target]);
+      }
+    },
+  },
+  ban: {
+    desc: 'Bannit un membre du groupe (kick + blocklist) — admin uniquement',
+    handler: async (ctx) => {
+      if (!ctx.isGroup) return ctx.reply('❌ Commande de groupe uniquement.');
+      if (!ctx.isSenderAdmin) return ctx.reply('❌ Réservé aux admins du groupe.');
+      if (!ctx.isBotAdmin) return ctx.reply('❌ Le bot doit être admin pour ça.');
+      const target = ctx.mentionedJid[0] || ctx.quotedParticipant;
+      if (!target) return ctx.reply('❌ Mentionne ou réponds à la personne à bannir.');
+      store.banUser(ctx.from, target);
+      await ctx.sock.groupParticipantsUpdate(ctx.from, [target], 'remove');
+      await ctx.reply('🚫 Membre banni (re-expulsé automatiquement s\'il revient).');
+    },
+  },
+  unban: {
+    desc: "Lève le bannissement local d'un membre — admin uniquement",
+    handler: async (ctx) => {
+      if (!ctx.isGroup) return ctx.reply('❌ Commande de groupe uniquement.');
+      if (!ctx.isSenderAdmin) return ctx.reply('❌ Réservé aux admins du groupe.');
+      const target = ctx.mentionedJid[0] || ctx.quotedParticipant;
+      if (!target) return ctx.reply('❌ Mentionne ou réponds à la personne à débannir.');
+      store.unbanUser(ctx.from, target);
+      await ctx.reply('✅ Membre débanni.');
+    },
+  },
+  mute: {
+    desc: 'Verrouille le groupe (admins seulement) — admin uniquement',
+    handler: async (ctx) => {
+      if (!ctx.isGroup) return ctx.reply('❌ Commande de groupe uniquement.');
+      if (!ctx.isSenderAdmin) return ctx.reply('❌ Réservé aux admins du groupe.');
+      if (!ctx.isBotAdmin) return ctx.reply('❌ Le bot doit être admin pour ça.');
+      await ctx.sock.groupSettingUpdate(ctx.from, 'announcement');
+      await ctx.reply('🔇 Groupe verrouillé — seuls les admins peuvent écrire.');
+    },
+  },
+  unmute: {
+    desc: 'Déverrouille le groupe — admin uniquement',
+    handler: async (ctx) => {
+      if (!ctx.isGroup) return ctx.reply('❌ Commande de groupe uniquement.');
+      if (!ctx.isSenderAdmin) return ctx.reply('❌ Réservé aux admins du groupe.');
+      if (!ctx.isBotAdmin) return ctx.reply('❌ Le bot doit être admin pour ça.');
+      await ctx.sock.groupSettingUpdate(ctx.from, 'not_announcement');
+      await ctx.reply('🔊 Groupe déverrouillé — tout le monde peut écrire.');
+    },
+  },
+  promote: {
+    desc: 'Promeut un membre admin — admin uniquement',
+    handler: async (ctx) => {
+      if (!ctx.isGroup) return ctx.reply('❌ Commande de groupe uniquement.');
+      if (!ctx.isSenderAdmin) return ctx.reply('❌ Réservé aux admins du groupe.');
+      if (!ctx.isBotAdmin) return ctx.reply('❌ Le bot doit être admin pour ça.');
+      const target = ctx.mentionedJid[0] || ctx.quotedParticipant;
+      if (!target) return ctx.reply('❌ Mentionne ou réponds à la personne à promouvoir.');
+      await ctx.sock.groupParticipantsUpdate(ctx.from, [target], 'promote');
+      await ctx.reply(`⬆️ @${target.split('@')[0]} est maintenant admin.`, [target]);
+    },
+  },
+  demote: {
+    desc: 'Rétrograde un admin — admin uniquement',
+    handler: async (ctx) => {
+      if (!ctx.isGroup) return ctx.reply('❌ Commande de groupe uniquement.');
+      if (!ctx.isSenderAdmin) return ctx.reply('❌ Réservé aux admins du groupe.');
+      if (!ctx.isBotAdmin) return ctx.reply('❌ Le bot doit être admin pour ça.');
+      const target = ctx.mentionedJid[0] || ctx.quotedParticipant;
+      if (!target) return ctx.reply('❌ Mentionne ou réponds à la personne à rétrograder.');
+      await ctx.sock.groupParticipantsUpdate(ctx.from, [target], 'demote');
+      await ctx.reply(`⬇️ @${target.split('@')[0]} n'est plus admin.`, [target]);
+    },
+  },
+  sticker: {
+    desc: 'Convertit une image (en réponse) en sticker',
+    handler: async (ctx) => {
+      const quoted = ctx.msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+      const imgMsg = ctx.msg.message?.imageMessage || quoted?.imageMessage;
+      if (!imgMsg) return ctx.reply('❌ Réponds à une image avec !sticker.');
+      const buffer = await downloadMediaMessage({ message: { imageMessage: imgMsg } }, 'buffer', {});
+      const webp = await sharp(buffer).resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }).webp().toBuffer();
+      await ctx.sock.sendMessage(ctx.from, { sticker: webp });
+    },
+  },
+  info: {
+    desc: 'Affiche les infos et statistiques du bot',
+    handler: async (ctx) => {
+      await ctx.reply(`ℹ️ *Infos du bot*\nUptime: ${fmtDuration(Date.now() - START_TIME)}\nCommandes: ${Object.keys(commands).length}\nPréfixe: ${PREFIX}`);
+    },
+  },
+  rules: {
+    desc: 'Affiche ou définit les règles du groupe — usage: !rules [texte, admin uniquement]',
+    handler: async (ctx) => {
+      if (!ctx.isGroup) return ctx.reply('❌ Commande de groupe uniquement.');
+      if (ctx.text) {
+        if (!ctx.isSenderAdmin) return ctx.reply('❌ Réservé aux admins pour définir les règles.');
+        store.setRules(ctx.from, ctx.text);
+        return ctx.reply('✅ Règles mises à jour.');
+      }
+      const rules = store.getRules(ctx.from);
+      await ctx.reply(rules ? `📜 *Règles du groupe*\n${rules}` : `Aucune règle définie. Un admin peut en définir avec ${PREFIX}rules <texte>`);
+    },
+  },
+};
+
+// =========================================================
+// CONNEXION & ROUTAGE DES MESSAGES
+// =========================================================
+function ask(question) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => rl.question(question, (ans) => { rl.close(); resolve(ans); }));
+}
+
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+  const { version } = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({ version, auth: state, logger: pino({ level: 'silent' }), printQRInTerminal: false });
+
+  if (!sock.authState.creds.registered) {
+    const phoneNumber = BOT_PHONE_NUMBER || await ask('Numéro du bot (format international, sans +): ');
+    setTimeout(async () => {
+      try {
+        const code = await sock.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
+        console.log(`\n📲 Code de jumelage: ${code}\n(WhatsApp > Appareils liés > Lier un appareil > Lier avec un numéro de téléphone)\n`);
+      } catch (err) {
+        console.error('Erreur pairing code:', err);
+      }
+    }, 3000);
+  }
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update;
+    if (connection === 'close') {
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('Connexion fermée.', shouldReconnect ? 'Reconnexion...' : 'Déconnecté.');
+      if (shouldReconnect) startBot();
+    } else if (connection === 'open') {
+      console.log('✅ Bot connecté à WhatsApp.');
+    }
+  });
+
+  sock.ev.on('group-participants.update', async (update) => {
+    if (update.action === 'add') {
+      for (const participant of update.participants) {
+        if (store.isBanned(update.id, participant)) {
+          try { await sock.groupParticipantsUpdate(update.id, [participant], 'remove'); } catch (e) {}
+        }
+      }
+    }
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    const msg = messages[0];
+    if (!msg.message || msg.key.fromMe) return;
+
+    const from = msg.key.remoteJid;
+    const isGroup = from.endsWith('@g.us');
+    const sender = isGroup ? msg.key.participant : from;
+    const body = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || '';
+
+    // Répondeur automatique : uniquement en message privé, hors commandes, avec cooldown par contact
+    if (!isGroup && !body.startsWith(PREFIX) && AUTO_REPLY_ENABLED) {
+      const now = Date.now();
+      const last = autoReplyLastSent.get(from) || 0;
+      if (now - last > AUTO_REPLY_COOLDOWN_MIN * 60 * 1000) {
+        autoReplyLastSent.set(from, now);
+        try { await sock.sendMessage(from, { text: AUTO_REPLY_MESSAGE }); } catch (e) { console.error('Erreur répondeur auto:', e); }
+      }
+      return;
+    }
+
+    if (!body.startsWith(PREFIX)) return;
+
+    const [rawCmd, ...args] = body.slice(PREFIX.length).trim().split(/\s+/);
+    const command = commands[rawCmd.toLowerCase()];
+    if (!command) return;
+
+    let groupMetadata = null, isSenderAdmin = false, isBotAdmin = false;
+    if (isGroup) {
+      try {
+        groupMetadata = await sock.groupMetadata(from);
+        isSenderAdmin = !!groupMetadata.participants.find(p => p.id === sender)?.admin;
+        const botNum = sock.user.id.split(':')[0];
+        isBotAdmin = !!groupMetadata.participants.find(p => p.id.split('@')[0] === botNum)?.admin;
+      } catch (e) { console.error('Erreur metadata groupe:', e); }
+    }
+
+    const isOwner = OWNER_NUMBERS.includes(sender.split('@')[0]);
+    const mentionedJid = msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    const quotedParticipant = msg.message.extendedTextMessage?.contextInfo?.participant || null;
+    const quotedText = msg.message.extendedTextMessage?.contextInfo?.quotedMessage?.conversation || null;
+
+    const ctx = {
+      sock, msg, from, isGroup, sender, args, text: args.join(' '),
+      isOwner, isSenderAdmin: isSenderAdmin || isOwner, isBotAdmin,
+      groupMetadata, mentionedJid, quotedParticipant, quotedText,
+      reply: (text, mentions = []) => sock.sendMessage(from, { text, mentions }, { quoted: msg }),
+    };
+
+    try {
+      await command.handler(ctx);
+    } catch (err) {
+      console.error(`Erreur commande ${rawCmd}:`, err);
+      await ctx.reply("⚠️ Une erreur est survenue lors de l'exécution de la commande.");
+    }
+  });
+
+  return sock;
+}
+
+startBot().catch((err) => console.error('Erreur au démarrage:', err));
